@@ -1,0 +1,400 @@
+#!/usr/bin/env bun
+/**
+ * Command-line spaced-repetition flash cards for Ukrainian vocabulary.
+ *
+ * Two files live next to this script:
+ *
+ *   words.json     authored word list, appended to by hand
+ *   progress.json  scheduler state, owned by the app
+ *
+ * Each word yields two cards, one per direction. Cards are ordered by `due`
+ * alone; the clock enters only when a card is rescheduled. Times are Unix
+ * seconds.
+ */
+
+import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
+
+const DAY = 86400;
+const FIRST_INTERVAL = DAY; // gap after the first correct answer on a new card
+const MIN_INTERVAL = 600; // floor for the gap after a miss
+const GROW = 2.5; // gap multiplier on a correct answer
+const SHRINK = 4; // gap divisor on a miss
+const HINT_PENALTY = 0.75; // subtracted from GROW per hint used
+const DEFAULT_NEW_PER_SESSION = 10;
+
+const HINT_KEY = "?";
+const FORGOT_KEY = "!";
+const PROMPT = "> ";
+
+type Lang = "uk" | "en";
+type Direction = "uk-en" | "en-uk";
+type Result = "correct" | "wrong" | "forgot";
+
+interface Word {
+  id: string;
+  uk: string;
+  en: string;
+  aliases?: string[];
+}
+
+interface Review {
+  at: number;
+  result: Result;
+  hints: number;
+}
+
+interface CardState {
+  last_challenge: number | null;
+  due: number;
+  history: Review[];
+}
+
+interface Progress {
+  version: 1;
+  cards: Record<string, CardState>;
+}
+
+interface Picked {
+  key: string;
+  word: Word;
+  direction: Direction;
+  state: CardState;
+}
+
+const DIRECTIONS: Record<Direction, { cue: Lang; answer: Lang; label: string }> = {
+  "uk-en": { cue: "uk", answer: "en", label: "uk → en" },
+  "en-uk": { cue: "en", answer: "uk", label: "en → uk" },
+};
+
+const ARTICLES = new Set(["the", "a", "an", "to"]);
+const APOSTROPHES = /[’ʼ‘`´]/g;
+const NON_WORD = /[^\p{L}\p{N}_\s']/gu;
+
+const HERE = dirname(realpathSync(fileURLToPath(import.meta.url)));
+
+function fail(message: string): never {
+  console.error(message);
+  process.exit(1);
+}
+
+export function normalize(text: string, lang: Lang): string {
+  const cleaned = text.normalize("NFC").toLowerCase().replace(APOSTROPHES, "'").replace(NON_WORD, " ");
+  const words = cleaned.split(/\s+/).filter((w) => w.length > 0);
+  if (lang === "en") {
+    while (words.length > 1 && ARTICLES.has(words[0])) {
+      words.shift();
+    }
+  }
+  return words.join(" ");
+}
+
+function loadJson(path: string): unknown {
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function saveJson(path: string, data: unknown): void {
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  renameSync(tmp, path);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+export function loadWords(path: string): Map<string, Word> {
+  if (!existsSync(path)) {
+    fail(`${path}: not found; create it as a JSON list of {id, uk, en, aliases?} objects`);
+  }
+  const raw = loadJson(path);
+  if (!Array.isArray(raw)) {
+    fail(`${path}: expected a JSON list`);
+  }
+  const byId = new Map<string, Word>();
+  raw.forEach((entry: unknown, i: number) => {
+    if (!isRecord(entry)) {
+      fail(`${path}: entry ${i} is not an object`);
+    }
+    for (const field of ["id", "uk", "en"] as const) {
+      if (!isNonEmptyString(entry[field])) {
+        fail(`${path}: entry ${i} is missing a non-empty string '${field}'`);
+      }
+    }
+    const id = entry.id as string;
+    const aliases = entry.aliases ?? [];
+    if (!isStringArray(aliases)) {
+      fail(`${path}: entry '${id}' has a non-list-of-strings 'aliases'`);
+    }
+    if (byId.has(id)) {
+      fail(`${path}: duplicate id '${id}'`);
+    }
+    byId.set(id, { id, uk: entry.uk as string, en: entry.en as string, aliases });
+  });
+  return byId;
+}
+
+function loadProgress(path: string): Progress {
+  if (!existsSync(path)) {
+    return { version: 1, cards: {} };
+  }
+  return loadJson(path) as Progress;
+}
+
+export function ingest(words: Map<string, Word>, cards: Record<string, CardState>, now: number): number {
+  let added = 0;
+  for (const wordId of words.keys()) {
+    for (const direction of Object.keys(DIRECTIONS)) {
+      const key = `${wordId}:${direction}`;
+      if (!(key in cards)) {
+        cards[key] = { last_challenge: null, due: now, history: [] };
+        added += 1;
+      }
+    }
+  }
+  return added;
+}
+
+export function isNew(state: CardState): boolean {
+  return state.last_challenge === null;
+}
+
+function splitKey(key: string): { wordId: string; direction: Direction } {
+  const sep = key.lastIndexOf(":");
+  return { wordId: key.slice(0, sep), direction: key.slice(sep + 1) as Direction };
+}
+
+export function selectCard(
+  words: Map<string, Word>,
+  cards: Record<string, CardState>,
+  newRemaining: number,
+): Picked | null {
+  const ordered = Object.entries(cards).sort(([ka, sa], [kb, sb]) => {
+    if (sa.due !== sb.due) return sa.due - sb.due;
+    return ka < kb ? -1 : ka > kb ? 1 : 0;
+  });
+  for (const [key, state] of ordered) {
+    const { wordId, direction } = splitKey(key);
+    const word = words.get(wordId);
+    if (word === undefined) continue;
+    if (isNew(state) && newRemaining <= 0) continue;
+    return { key, word, direction, state };
+  }
+  return null;
+}
+
+export function nextInterval(state: CardState, correct: boolean, hints: number): number {
+  const base = isNew(state) ? FIRST_INTERVAL / GROW : state.due - (state.last_challenge as number);
+  if (correct) {
+    return base * Math.max(1, GROW - HINT_PENALTY * hints);
+  }
+  return Math.max(base / SHRINK, MIN_INTERVAL);
+}
+
+export function reschedule(state: CardState, result: Result, hints: number, now: number): number {
+  const gap = nextInterval(state, result === "correct", hints);
+  state.last_challenge = now;
+  state.due = now + gap;
+  state.history.push({ at: now, result, hints });
+  return gap;
+}
+
+function acceptedAnswers(word: Word, answerLang: Lang): Set<string> {
+  const answers = new Set([normalize(word[answerLang], answerLang)]);
+  for (const alias of word.aliases ?? []) {
+    answers.add(normalize(alias, answerLang));
+  }
+  return answers;
+}
+
+export function mask(answer: string, revealed: number): string {
+  let shown = 0;
+  const out: string[] = [];
+  for (const ch of answer) {
+    if (/\s/.test(ch)) {
+      out.push("  ");
+    } else if (shown < revealed) {
+      out.push(`${ch} `);
+      shown += 1;
+    } else {
+      out.push("_ ");
+    }
+  }
+  return out.join("").trimEnd();
+}
+
+export function letterCount(answer: string): number {
+  let n = 0;
+  for (const ch of answer) {
+    if (!/\s/.test(ch)) n += 1;
+  }
+  return n;
+}
+
+export function humanize(seconds: number): string {
+  if (seconds < 3600) return `${(seconds / 60).toFixed(0)} min`;
+  if (seconds < 2 * DAY) return `${(seconds / 3600).toFixed(1)} h`;
+  return `${(seconds / DAY).toFixed(1)} d`;
+}
+
+class Prompt {
+  // The prompt is written directly rather than via rl.prompt(): under Bun,
+  // a second rl.prompt() call keeps the process alive after stdin closes.
+  // `prompt` is still passed so line redraws in terminal mode stay aligned.
+  private readonly rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: process.stdin.isTTY === true,
+    prompt: PROMPT,
+  });
+  private readonly lines = this.rl[Symbol.asyncIterator]();
+
+  constructor() {
+    this.rl.on("SIGINT", () => {
+      console.log();
+      process.exit(0);
+    });
+  }
+
+  /** Returns the next input line, or null when stdin is closed. */
+  async ask(): Promise<string | null> {
+    process.stdout.write(PROMPT);
+    const next = await this.lines.next();
+    // Bun's terminal-mode iterator yields an undefined value on Ctrl-D
+    // instead of finishing, so treat both as end of input.
+    return next.done || next.value === undefined ? null : next.value;
+  }
+
+  close(): void {
+    this.rl.close();
+  }
+}
+
+/** Runs one card interactively. Returns null when stdin is closed. */
+async function challenge(
+  prompt: Prompt,
+  word: Word,
+  direction: Direction,
+): Promise<{ result: Result; hints: number } | null> {
+  const { cue, answer: answerLang, label } = DIRECTIONS[direction];
+  const answer = word[answerLang];
+  const accepted = acceptedAnswers(word, answerLang);
+  const total = letterCount(answer);
+  let hints = 0;
+
+  console.log(`\n[${label}]  ${word[cue]}`);
+  for (;;) {
+    const raw = await prompt.ask();
+    if (raw === null) {
+      console.log();
+      return null;
+    }
+    const line = raw.trim();
+    if (line === HINT_KEY) {
+      hints += 1;
+      if (hints >= total) {
+        console.log(`  forgot: ${answer}`);
+        return { result: "forgot", hints };
+      }
+      console.log(`  ${mask(answer, hints)}`);
+      continue;
+    }
+    if (line === FORGOT_KEY) {
+      console.log(`  forgot: ${answer}`);
+      return { result: "forgot", hints };
+    }
+    if (line.length === 0) {
+      console.log(`  type the answer, ${HINT_KEY} for a hint, ${FORGOT_KEY} if you forgot`);
+      continue;
+    }
+    if (accepted.has(normalize(line, answerLang))) {
+      console.log("  correct");
+      return { result: "correct", hints };
+    }
+    console.log(`  wrong: ${answer}`);
+    return { result: "wrong", hints };
+  }
+}
+
+function nowSeconds(): number {
+  return Date.now() / 1000;
+}
+
+async function main(): Promise<void> {
+  const { values } = parseArgs({
+    options: {
+      words: { type: "string", default: join(HERE, "words.json") },
+      progress: { type: "string", default: join(HERE, "progress.json") },
+      new: { type: "string", default: String(DEFAULT_NEW_PER_SESSION) },
+      help: { type: "boolean", short: "h", default: false },
+    },
+  });
+  if (values.help) {
+    console.log(
+      "usage: ukralearn [--words PATH] [--progress PATH] [--new N]\n\n" +
+        "Ukrainian flash cards with spaced repetition.\n" +
+        "  --new N   maximum new cards to introduce this session (default 10)",
+    );
+    return;
+  }
+  const newLimit = Number(values.new);
+  if (!Number.isInteger(newLimit) || newLimit < 0) {
+    fail(`--new: expected a non-negative integer, got '${values.new}'`);
+  }
+
+  const words = loadWords(values.words as string);
+  const progressPath = values.progress as string;
+  const progress = loadProgress(progressPath);
+  const cards = progress.cards;
+
+  const now = nowSeconds();
+  if (ingest(words, cards, now) > 0) {
+    saveJson(progressPath, progress);
+  }
+
+  const live = Object.entries(cards)
+    .filter(([key]) => words.has(splitKey(key).wordId))
+    .map(([, state]) => state);
+  const newCount = live.filter(isNew).length;
+  const dueCount = live.filter((s) => !isNew(s) && s.due <= now).length;
+  console.log(`cards: ${live.length}  due: ${dueCount}  new: ${newCount}  (Ctrl-D to quit)`);
+
+  const prompt = new Prompt();
+  let newRemaining = newLimit;
+  try {
+    for (;;) {
+      const picked = selectCard(words, cards, newRemaining);
+      if (picked === null) {
+        console.log("nothing left to show this session");
+        return;
+      }
+      if (isNew(picked.state)) {
+        newRemaining -= 1;
+      }
+      const outcome = await challenge(prompt, picked.word, picked.direction);
+      if (outcome === null) {
+        return;
+      }
+      const gap = reschedule(picked.state, outcome.result, outcome.hints, nowSeconds());
+      saveJson(progressPath, progress);
+      console.log(`  next in ${humanize(gap)}`);
+    }
+  } finally {
+    prompt.close();
+  }
+}
+
+if (import.meta.main) {
+  await main();
+}
