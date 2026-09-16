@@ -179,6 +179,7 @@ export function selectCard(
   words: Map<string, Word>,
   cards: Record<string, CardState>,
   newRemaining: number,
+  directions: ReadonlySet<Direction>,
 ): Picked | null {
   const ordered = Object.entries(cards).sort(([ka, sa], [kb, sb]) => {
     if (sa.due !== sb.due) return sa.due - sb.due;
@@ -186,6 +187,7 @@ export function selectCard(
   });
   for (const [key, state] of ordered) {
     const { wordId, direction } = splitKey(key);
+    if (!directions.has(direction)) continue;
     const word = words.get(wordId);
     if (word === undefined) continue;
     if (isNew(state) && newRemaining <= 0) continue;
@@ -331,26 +333,63 @@ function nowSeconds(): number {
   return Date.now() / 1000;
 }
 
+const MODES: Record<string, ReadonlySet<Direction>> = {
+  "uk-en": new Set<Direction>(["uk-en"]),
+  "en-uk": new Set<Direction>(["en-uk"]),
+  both: new Set<Direction>(["uk-en", "en-uk"]),
+};
+
+const MENU: ReadonlyArray<[key: string, mode: string, label: string]> = [
+  ["1", "uk-en", DIRECTIONS["uk-en"].label],
+  ["2", "en-uk", DIRECTIONS["en-uk"].label],
+  ["3", "both", "both"],
+];
+
+/** Shows the home screen. Returns the chosen directions, or null when stdin is closed. */
+async function chooseDirections(prompt: Prompt): Promise<ReadonlySet<Direction> | null> {
+  console.log("ukralearn");
+  for (const [key, , label] of MENU) {
+    console.log(`  ${key}  ${label}`);
+  }
+  for (;;) {
+    const raw = await prompt.ask();
+    if (raw === null) {
+      console.log();
+      return null;
+    }
+    const entry = MENU.find(([key]) => key === raw.trim());
+    if (entry !== undefined) {
+      return MODES[entry[1]];
+    }
+    console.log(`  press ${MENU.map(([key]) => key).join(", ")} or Ctrl-D`);
+  }
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
       words: { type: "string", default: join(HERE, "words.json") },
       progress: { type: "string", default: join(HERE, "progress.json") },
       new: { type: "string", default: String(DEFAULT_NEW_PER_SESSION) },
+      direction: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
     console.log(
-      "usage: ukralearn [--words PATH] [--progress PATH] [--new N]\n\n" +
+      "usage: ukralearn [--words PATH] [--progress PATH] [--new N] [--direction MODE]\n\n" +
         "Ukrainian flash cards with spaced repetition.\n" +
-        "  --new N   maximum new cards to introduce this session (default 10)",
+        "  --new N           maximum new cards to introduce this session (default 10)\n" +
+        "  --direction MODE  skip the home screen; MODE is uk-en, en-uk or both",
     );
     return;
   }
   const newLimit = Number(values.new);
   if (!Number.isInteger(newLimit) || newLimit < 0) {
     fail(`--new: expected a non-negative integer, got '${values.new}'`);
+  }
+  if (values.direction !== undefined && !(values.direction in MODES)) {
+    fail(`--direction: expected one of ${Object.keys(MODES).join(", ")}, got '${values.direction}'`);
   }
 
   const words = loadWords(values.words as string);
@@ -363,18 +402,26 @@ async function main(): Promise<void> {
     saveJson(progressPath, progress);
   }
 
-  const live = Object.entries(cards)
-    .filter(([key]) => words.has(splitKey(key).wordId))
-    .map(([, state]) => state);
-  const newCount = live.filter(isNew).length;
-  const dueCount = live.filter((s) => !isNew(s) && s.due <= now).length;
-  console.log(`cards: ${live.length}  due: ${dueCount}  new: ${newCount}  (Ctrl-D to quit)`);
-
   const prompt = new Prompt();
   let newRemaining = newLimit;
   try {
+    const directions = values.direction !== undefined ? MODES[values.direction] : await chooseDirections(prompt);
+    if (directions === null) {
+      return;
+    }
+
+    const live = Object.entries(cards)
+      .filter(([key]) => {
+        const { wordId, direction } = splitKey(key);
+        return directions.has(direction) && words.has(wordId);
+      })
+      .map(([, state]) => state);
+    const newCount = live.filter(isNew).length;
+    const dueCount = live.filter((s) => !isNew(s) && s.due <= now).length;
+    console.log(`cards: ${live.length}  due: ${dueCount}  new: ${newCount}  (Ctrl-D to quit)`);
+
     for (;;) {
-      const picked = selectCard(words, cards, newRemaining);
+      const picked = selectCard(words, cards, newRemaining, directions);
       if (picked === null) {
         console.log("nothing left to show this session");
         return;
