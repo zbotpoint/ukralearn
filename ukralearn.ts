@@ -442,11 +442,22 @@ async function main(): Promise<void> {
         `${dim("new:")} ${bold(String(newCount))}  ${dim("(Ctrl-D to quit)")}`,
     );
 
+    let continueAnyway = false;
     for (;;) {
       const picked = selectCard(words, cards, directions);
       if (picked === null) {
         console.log(dim("nothing left to show this session"));
         return;
+      }
+      const wait = picked.state.due - nowSeconds();
+      if (wait > 0 && !continueAnyway) {
+        console.log(`\n${bold("nothing due right now")}  ${dim(`next card in ${humanize(wait)}`)}`);
+        console.log(dim("  Enter to continue anyway, Ctrl-D to quit"));
+        if ((await prompt.ask()) === null) {
+          console.log();
+          return;
+        }
+        continueAnyway = true;
       }
       const outcome = await challenge(prompt, picked.word, picked.direction);
       if (outcome === null) {
