@@ -384,7 +384,7 @@ const CHART_BUCKETS: ReadonlyArray<[label: string, withinSeconds: number]> = [
 ];
 const CHART_BAR_WIDTH = 40;
 
-/** Prints, per direction, how many cards fall due within each cumulative window. */
+/** Prints, per direction, how many cards fall due in each time window. */
 function printDueChart(words: Map<string, Word>, cards: Record<string, CardState>, now: number): void {
   for (const direction of Object.keys(DIRECTIONS) as Direction[]) {
     const waits = Object.entries(cards)
@@ -393,10 +393,10 @@ function printDueChart(words: Map<string, Word>, cards: Record<string, CardState
         return parts.direction === direction && words.has(parts.wordId);
       })
       .map(([, state]) => state.due - now);
-    const rows: Array<[string, number]> = CHART_BUCKETS.map(([label, within]) => [
-      label,
-      waits.filter((w) => w <= within).length,
-    ]);
+    const rows: Array<[string, number]> = CHART_BUCKETS.map(([label, upper], i) => {
+      const lower = i === 0 ? -Infinity : CHART_BUCKETS[i - 1][1];
+      return [label, waits.filter((w) => w > lower && w <= upper).length];
+    });
     rows.push(["later", waits.filter((w) => w > CHART_BUCKETS[CHART_BUCKETS.length - 1][1]).length]);
     const scale = Math.max(1, ...rows.map(([, n]) => n));
     const labelWidth = Math.max(...rows.map(([label]) => label.length));
