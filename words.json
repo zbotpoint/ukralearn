@@ -50,7 +50,7 @@
   {"id": "karta", "uk": "ка́рта", "en": "map", "aliases": ["ма́па"]},
   {"id": "kartyna", "uk": "карти́на", "en": "picture"},
   {"id": "kvartyra", "uk": "кварти́ра", "en": "apartment"},
-  {"id": "urok", "uk": "уро́к", "en": "lesson"},
+  {"id": "lektsiia", "uk": "ле́кція", "en": "lesson"},
   {"id": "lampa", "uk": "ла́мпа", "en": "lamp"},
   {"id": "maty", "uk": "ма́ти", "en": "mother", "aliases": ["ма́ма"]},
   {"id": "opera", "uk": "о́пера", "en": "opera"},
