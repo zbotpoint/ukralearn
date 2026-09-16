@@ -20,11 +20,9 @@ import { parseArgs } from "node:util";
 
 const DAY = 86400;
 const FIRST_INTERVAL = DAY; // gap after the first correct answer on a new card
-const MIN_INTERVAL = 600; // floor for the gap after a miss
+const MISS_INTERVAL = 300; // fixed gap after a wrong or forgotten answer
 const GROW = 2.5; // gap multiplier on a correct answer
-const SHRINK = 4; // gap divisor on a miss
 const HINT_PENALTY = 0.75; // subtracted from GROW per hint used
-const DEFAULT_NEW_PER_SESSION = 10;
 
 const HINT_KEY = "?";
 const FORGOT_KEY = "!";
@@ -73,6 +71,8 @@ const DIRECTIONS: Record<Direction, { cue: Lang; answer: Lang; label: string }> 
 const ARTICLES = new Set(["the", "a", "an", "to"]);
 const APOSTROPHES = /[’ʼ‘`´]/g;
 const NON_WORD = /[^\p{L}\p{N}_\s']/gu;
+const STRESS = /́/g; // combining acute accent, used for stress marks in words.json
+const CLUSTERS = /\P{M}\p{M}*/gu; // a base character with its combining marks
 
 const HERE = dirname(realpathSync(fileURLToPath(import.meta.url)));
 
@@ -95,7 +95,12 @@ function fail(message: string): never {
 }
 
 export function normalize(text: string, lang: Lang): string {
-  const cleaned = text.normalize("NFC").toLowerCase().replace(APOSTROPHES, "'").replace(NON_WORD, " ");
+  const cleaned = text
+    .normalize("NFC")
+    .replace(STRESS, "")
+    .toLowerCase()
+    .replace(APOSTROPHES, "'")
+    .replace(NON_WORD, " ");
   const words = cleaned.split(/\s+/).filter((w) => w.length > 0);
   if (lang === "en") {
     while (words.length > 1 && ARTICLES.has(words[0])) {
@@ -192,7 +197,6 @@ function splitKey(key: string): { wordId: string; direction: Direction } {
 export function selectCard(
   words: Map<string, Word>,
   cards: Record<string, CardState>,
-  newRemaining: number,
   directions: ReadonlySet<Direction>,
   random: () => number = Math.random,
 ): Picked | null {
@@ -203,7 +207,6 @@ export function selectCard(
     if (!directions.has(direction)) continue;
     const word = words.get(wordId);
     if (word === undefined) continue;
-    if (isNew(state) && newRemaining <= 0) continue;
     const picked = { key, word, direction, state };
     if (earliest.length === 0 || state.due < earliest[0].state.due) {
       earliest = [picked];
@@ -215,16 +218,16 @@ export function selectCard(
   return earliest[Math.floor(random() * earliest.length)];
 }
 
-export function nextInterval(state: CardState, correct: boolean, hints: number): number {
-  const base = isNew(state) ? FIRST_INTERVAL / GROW : state.due - (state.last_challenge as number);
-  if (correct) {
-    return base * Math.max(1, GROW - HINT_PENALTY * hints);
+export function nextInterval(state: CardState, result: Result, hints: number): number {
+  if (result !== "correct") {
+    return MISS_INTERVAL;
   }
-  return Math.max(base / SHRINK, MIN_INTERVAL);
+  const base = isNew(state) ? FIRST_INTERVAL / GROW : state.due - (state.last_challenge as number);
+  return base * Math.max(1, GROW - HINT_PENALTY * hints);
 }
 
 export function reschedule(state: CardState, result: Result, hints: number, now: number): number {
-  const gap = nextInterval(state, result === "correct", hints);
+  const gap = nextInterval(state, result, hints);
   state.last_challenge = now;
   state.due = now + gap;
   state.history.push({ at: now, result, hints });
@@ -242,11 +245,11 @@ function acceptedAnswers(word: Word, answerLang: Lang): Set<string> {
 export function mask(answer: string, revealed: number): string {
   let shown = 0;
   const out: string[] = [];
-  for (const ch of answer) {
-    if (/\s/.test(ch)) {
+  for (const cluster of answer.normalize("NFC").match(CLUSTERS) ?? []) {
+    if (/\s/.test(cluster)) {
       out.push("  ");
     } else if (shown < revealed) {
-      out.push(`${ch} `);
+      out.push(`${cluster} `);
       shown += 1;
     } else {
       out.push("_ ");
@@ -257,8 +260,8 @@ export function mask(answer: string, revealed: number): string {
 
 export function letterCount(answer: string): number {
   let n = 0;
-  for (const ch of answer) {
-    if (!/\s/.test(ch)) n += 1;
+  for (const cluster of answer.normalize("NFC").match(CLUSTERS) ?? []) {
+    if (!/\s/.test(cluster)) n += 1;
   }
   return n;
 }
@@ -389,23 +392,17 @@ async function main(): Promise<void> {
     options: {
       words: { type: "string", default: join(HERE, "words.json") },
       progress: { type: "string", default: join(HERE, "progress.json") },
-      new: { type: "string", default: String(DEFAULT_NEW_PER_SESSION) },
       direction: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
     console.log(
-      "usage: ukralearn [--words PATH] [--progress PATH] [--new N] [--direction MODE]\n\n" +
+      "usage: ukralearn [--words PATH] [--progress PATH] [--direction MODE]\n\n" +
         "Ukrainian flash cards with spaced repetition.\n" +
-        "  --new N           maximum new cards to introduce this session (default 10)\n" +
         "  --direction MODE  skip the home screen; MODE is uk-en, en-uk or both",
     );
     return;
-  }
-  const newLimit = Number(values.new);
-  if (!Number.isInteger(newLimit) || newLimit < 0) {
-    fail(`--new: expected a non-negative integer, got '${values.new}'`);
   }
   if (values.direction !== undefined && !(values.direction in MODES)) {
     fail(`--direction: expected one of ${Object.keys(MODES).join(", ")}, got '${values.direction}'`);
@@ -422,7 +419,6 @@ async function main(): Promise<void> {
   }
 
   const prompt = new Prompt();
-  let newRemaining = newLimit;
   try {
     const directions = values.direction !== undefined ? MODES[values.direction] : await chooseDirections(prompt);
     if (directions === null) {
@@ -443,13 +439,10 @@ async function main(): Promise<void> {
     );
 
     for (;;) {
-      const picked = selectCard(words, cards, newRemaining, directions);
+      const picked = selectCard(words, cards, directions);
       if (picked === null) {
         console.log(dim("nothing left to show this session"));
         return;
-      }
-      if (isNew(picked.state)) {
-        newRemaining -= 1;
       }
       const outcome = await challenge(prompt, picked.word, picked.direction);
       if (outcome === null) {
