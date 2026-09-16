@@ -68,7 +68,7 @@
   {"id": "horod", "uk": "горо́д", "en": "garden"},
   {"id": "kyiv", "uk": "Ки́їв", "en": "Kyiv"},
   {"id": "pysmennytsia", "uk": "письме́нниця", "en": "writer (f)", "aliases": ["writer"]},
-  {"id": "avtomobil", "uk": "автомобі́ль", "en": "automobile"},
+  {"id": "avtomobil", "uk": "автомобі́ль", "en": "automobile", "aliases": ["car"]},
   {"id": "kino", "uk": "кіно́", "en": "cinema"},
   {"id": "stilets", "uk": "стіле́ць", "en": "chair"},
   {"id": "lito", "uk": "лі́то", "en": "summer"},
