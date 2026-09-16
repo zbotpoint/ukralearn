@@ -27,6 +27,7 @@ const HINT_PENALTY = 0.75; // subtracted from GROW per hint used
 const HINT_KEY = "?";
 const FORGOT_KEY = "!";
 const PROMPT = "> ";
+const MASK_WIDTH = 20; // blanks shown in a hint, independent of answer length
 
 type Lang = "uk" | "en";
 type Direction = "uk-en" | "en-uk";
@@ -242,18 +243,21 @@ function acceptedAnswers(word: Word, answerLang: Lang): Set<string> {
   return answers;
 }
 
+/** Shows the first `revealed` letters, then pads with blanks to a fixed width so length is not disclosed. */
 export function mask(answer: string, revealed: number): string {
   let shown = 0;
   const out: string[] = [];
   for (const cluster of answer.normalize("NFC").match(CLUSTERS) ?? []) {
+    if (shown >= revealed) break;
     if (/\s/.test(cluster)) {
       out.push("  ");
-    } else if (shown < revealed) {
+    } else {
       out.push(`${cluster} `);
       shown += 1;
-    } else {
-      out.push("_ ");
     }
+  }
+  while (out.length < MASK_WIDTH) {
+    out.push("_ ");
   }
   return out.join("").trimEnd();
 }
