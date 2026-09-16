@@ -365,18 +365,64 @@ const MODES: Record<string, ReadonlySet<Direction>> = {
   both: new Set<Direction>(["uk-en", "en-uk"]),
 };
 
+const CHART = "chart";
+
 const MENU: ReadonlyArray<[key: string, mode: string, label: string]> = [
   ["1", "uk-en", DIRECTIONS["uk-en"].label],
   ["2", "en-uk", DIRECTIONS["en-uk"].label],
   ["3", "both", "both"],
+  ["4", CHART, "when cards are due"],
 ];
 
-/** Shows the home screen. Returns the chosen directions, or null when stdin is closed. */
-async function chooseDirections(prompt: Prompt): Promise<ReadonlySet<Direction> | null> {
-  console.log(bold("ukralearn"));
-  for (const [key, , label] of MENU) {
-    console.log(`  ${bold(cyan(key))}  ${label}`);
+const CHART_BUCKETS: ReadonlyArray<[label: string, withinSeconds: number]> = [
+  ["due now", 0],
+  ["≤ 10 min", 600],
+  ["≤ 1 h", 3600],
+  ["≤ 6 h", 6 * 3600],
+  ["≤ 1 d", DAY],
+  ["≤ 1 w", 7 * DAY],
+];
+const CHART_BAR_WIDTH = 40;
+
+/** Prints, per direction, how many cards fall due within each cumulative window. */
+function printDueChart(words: Map<string, Word>, cards: Record<string, CardState>, now: number): void {
+  for (const direction of Object.keys(DIRECTIONS) as Direction[]) {
+    const waits = Object.entries(cards)
+      .filter(([key]) => {
+        const parts = splitKey(key);
+        return parts.direction === direction && words.has(parts.wordId);
+      })
+      .map(([, state]) => state.due - now);
+    const rows: Array<[string, number]> = CHART_BUCKETS.map(([label, within]) => [
+      label,
+      waits.filter((w) => w <= within).length,
+    ]);
+    rows.push(["later", waits.filter((w) => w > CHART_BUCKETS[CHART_BUCKETS.length - 1][1]).length]);
+    const scale = Math.max(1, ...rows.map(([, n]) => n));
+    const labelWidth = Math.max(...rows.map(([label]) => label.length));
+
+    console.log(`\n${bold(DIRECTIONS[direction].label)}  ${dim(`${waits.length} cards`)}`);
+    for (const [label, n] of rows) {
+      const bar = "█".repeat(Math.round((n / scale) * CHART_BAR_WIDTH));
+      console.log(`  ${label.padEnd(labelWidth)}  ${cyan(bar)}${bar ? " " : ""}${bold(String(n))}`);
+    }
   }
+  console.log();
+}
+
+/** Shows the home screen. Returns the chosen directions, or null when stdin is closed. */
+async function chooseDirections(
+  prompt: Prompt,
+  words: Map<string, Word>,
+  cards: Record<string, CardState>,
+): Promise<ReadonlySet<Direction> | null> {
+  const showMenu = (): void => {
+    console.log(bold("ukralearn"));
+    for (const [key, , label] of MENU) {
+      console.log(`  ${bold(cyan(key))}  ${label}`);
+    }
+  };
+  showMenu();
   for (;;) {
     const raw = await prompt.ask();
     if (raw === null) {
@@ -384,10 +430,16 @@ async function chooseDirections(prompt: Prompt): Promise<ReadonlySet<Direction> 
       return null;
     }
     const entry = MENU.find(([key]) => key === raw.trim());
-    if (entry !== undefined) {
-      return MODES[entry[1]];
+    if (entry === undefined) {
+      console.log(dim(`  press ${MENU.map(([key]) => key).join(", ")} or Ctrl-D`));
+      continue;
     }
-    console.log(dim(`  press ${MENU.map(([key]) => key).join(", ")} or Ctrl-D`));
+    if (entry[1] === CHART) {
+      printDueChart(words, cards, nowSeconds());
+      showMenu();
+      continue;
+    }
+    return MODES[entry[1]];
   }
 }
 
@@ -424,7 +476,8 @@ async function main(): Promise<void> {
 
   const prompt = new Prompt();
   try {
-    const directions = values.direction !== undefined ? MODES[values.direction] : await chooseDirections(prompt);
+    const directions =
+      values.direction !== undefined ? MODES[values.direction] : await chooseDirections(prompt, words, cards);
     if (directions === null) {
       return;
     }
