@@ -76,6 +76,19 @@ const NON_WORD = /[^\p{L}\p{N}_\s']/gu;
 
 const HERE = dirname(realpathSync(fileURLToPath(import.meta.url)));
 
+const COLOR = process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
+
+function sgr(code: string, text: string): string {
+  return COLOR ? `[${code}m${text}[0m` : text;
+}
+
+const bold = (text: string): string => sgr("1", text);
+const dim = (text: string): string => sgr("2", text);
+const red = (text: string): string => sgr("31", text);
+const green = (text: string): string => sgr("32", text);
+const yellow = (text: string): string => sgr("33", text);
+const cyan = (text: string): string => sgr("36", text);
+
 function fail(message: string): never {
   console.error(message);
   process.exit(1);
@@ -175,25 +188,31 @@ function splitKey(key: string): { wordId: string; direction: Direction } {
   return { wordId: key.slice(0, sep), direction: key.slice(sep + 1) as Direction };
 }
 
+/** Picks the eligible card with the earliest due time; ties are broken uniformly at random. */
 export function selectCard(
   words: Map<string, Word>,
   cards: Record<string, CardState>,
   newRemaining: number,
   directions: ReadonlySet<Direction>,
+  random: () => number = Math.random,
 ): Picked | null {
-  const ordered = Object.entries(cards).sort(([ka, sa], [kb, sb]) => {
-    if (sa.due !== sb.due) return sa.due - sb.due;
-    return ka < kb ? -1 : ka > kb ? 1 : 0;
-  });
-  for (const [key, state] of ordered) {
+  let earliest: Picked[] = [];
+  for (const [key, state] of Object.entries(cards)) {
+    if (earliest.length > 0 && state.due > earliest[0].state.due) continue;
     const { wordId, direction } = splitKey(key);
     if (!directions.has(direction)) continue;
     const word = words.get(wordId);
     if (word === undefined) continue;
     if (isNew(state) && newRemaining <= 0) continue;
-    return { key, word, direction, state };
+    const picked = { key, word, direction, state };
+    if (earliest.length === 0 || state.due < earliest[0].state.due) {
+      earliest = [picked];
+    } else {
+      earliest.push(picked);
+    }
   }
-  return null;
+  if (earliest.length === 0) return null;
+  return earliest[Math.floor(random() * earliest.length)];
 }
 
 export function nextInterval(state: CardState, correct: boolean, hints: number): number {
@@ -295,7 +314,7 @@ async function challenge(
   const total = letterCount(answer);
   let hints = 0;
 
-  console.log(`\n[${label}]  ${word[cue]}`);
+  console.log(`\n${dim(`[${label}]`)}  ${bold(cyan(word[cue]))}`);
   for (;;) {
     const raw = await prompt.ask();
     if (raw === null) {
@@ -306,25 +325,25 @@ async function challenge(
     if (line === HINT_KEY) {
       hints += 1;
       if (hints >= total) {
-        console.log(`  forgot: ${answer}`);
+        console.log(`  ${bold(red("forgot:"))} ${bold(answer)}`);
         return { result: "forgot", hints };
       }
-      console.log(`  ${mask(answer, hints)}`);
+      console.log(`  ${yellow(mask(answer, hints))}`);
       continue;
     }
     if (line === FORGOT_KEY) {
-      console.log(`  forgot: ${answer}`);
+      console.log(`  ${bold(red("forgot:"))} ${bold(answer)}`);
       return { result: "forgot", hints };
     }
     if (line.length === 0) {
-      console.log(`  type the answer, ${HINT_KEY} for a hint, ${FORGOT_KEY} if you forgot`);
+      console.log(dim(`  type the answer, ${HINT_KEY} for a hint, ${FORGOT_KEY} if you forgot`));
       continue;
     }
     if (accepted.has(normalize(line, answerLang))) {
-      console.log("  correct");
+      console.log(`  ${bold(green("correct"))}`);
       return { result: "correct", hints };
     }
-    console.log(`  wrong: ${answer}`);
+    console.log(`  ${bold(red("wrong:"))} ${bold(answer)}`);
     return { result: "wrong", hints };
   }
 }
@@ -347,9 +366,9 @@ const MENU: ReadonlyArray<[key: string, mode: string, label: string]> = [
 
 /** Shows the home screen. Returns the chosen directions, or null when stdin is closed. */
 async function chooseDirections(prompt: Prompt): Promise<ReadonlySet<Direction> | null> {
-  console.log("ukralearn");
+  console.log(bold("ukralearn"));
   for (const [key, , label] of MENU) {
-    console.log(`  ${key}  ${label}`);
+    console.log(`  ${bold(cyan(key))}  ${label}`);
   }
   for (;;) {
     const raw = await prompt.ask();
@@ -361,7 +380,7 @@ async function chooseDirections(prompt: Prompt): Promise<ReadonlySet<Direction> 
     if (entry !== undefined) {
       return MODES[entry[1]];
     }
-    console.log(`  press ${MENU.map(([key]) => key).join(", ")} or Ctrl-D`);
+    console.log(dim(`  press ${MENU.map(([key]) => key).join(", ")} or Ctrl-D`));
   }
 }
 
@@ -418,12 +437,15 @@ async function main(): Promise<void> {
       .map(([, state]) => state);
     const newCount = live.filter(isNew).length;
     const dueCount = live.filter((s) => !isNew(s) && s.due <= now).length;
-    console.log(`cards: ${live.length}  due: ${dueCount}  new: ${newCount}  (Ctrl-D to quit)`);
+    console.log(
+      `${dim("cards:")} ${bold(String(live.length))}  ${dim("due:")} ${bold(String(dueCount))}  ` +
+        `${dim("new:")} ${bold(String(newCount))}  ${dim("(Ctrl-D to quit)")}`,
+    );
 
     for (;;) {
       const picked = selectCard(words, cards, newRemaining, directions);
       if (picked === null) {
-        console.log("nothing left to show this session");
+        console.log(dim("nothing left to show this session"));
         return;
       }
       if (isNew(picked.state)) {
@@ -435,7 +457,7 @@ async function main(): Promise<void> {
       }
       const gap = reschedule(picked.state, outcome.result, outcome.hints, nowSeconds());
       saveJson(progressPath, progress);
-      console.log(`  next in ${humanize(gap)}`);
+      console.log(dim(`  next in ${humanize(gap)}`));
     }
   } finally {
     prompt.close();
