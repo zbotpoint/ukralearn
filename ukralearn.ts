@@ -21,6 +21,7 @@ import { parseArgs } from "node:util";
 const DAY = 86400;
 const FIRST_INTERVAL = DAY; // gap after the first correct answer on a new card
 const MISS_INTERVAL = 300; // fixed gap after a wrong or forgotten answer
+const DUE_WINDOW = 300; // cards due within this many seconds of the earliest are shuffled together
 const GROW = 2.5; // gap multiplier on a correct answer
 const HINT_PENALTY = 0.75; // subtracted from GROW per hint used
 
@@ -62,6 +63,11 @@ interface Picked {
   word: Word;
   direction: Direction;
   state: CardState;
+}
+
+interface Selection {
+  card: Picked;
+  earliestDue: number;
 }
 
 const DIRECTIONS: Record<Direction, { cue: Lang; answer: Lang; label: string }> = {
@@ -194,29 +200,28 @@ function splitKey(key: string): { wordId: string; direction: Direction } {
   return { wordId: key.slice(0, sep), direction: key.slice(sep + 1) as Direction };
 }
 
-/** Picks the eligible card with the earliest due time; ties are broken uniformly at random. */
+/**
+ * Picks uniformly at random among the eligible cards due within DUE_WINDOW of the
+ * earliest due time, so exact due times do not fix the order.
+ */
 export function selectCard(
   words: Map<string, Word>,
   cards: Record<string, CardState>,
   directions: ReadonlySet<Direction>,
   random: () => number = Math.random,
-): Picked | null {
-  let earliest: Picked[] = [];
+): Selection | null {
+  const eligible: Picked[] = [];
   for (const [key, state] of Object.entries(cards)) {
-    if (earliest.length > 0 && state.due > earliest[0].state.due) continue;
     const { wordId, direction } = splitKey(key);
     if (!directions.has(direction)) continue;
     const word = words.get(wordId);
     if (word === undefined) continue;
-    const picked = { key, word, direction, state };
-    if (earliest.length === 0 || state.due < earliest[0].state.due) {
-      earliest = [picked];
-    } else {
-      earliest.push(picked);
-    }
+    eligible.push({ key, word, direction, state });
   }
-  if (earliest.length === 0) return null;
-  return earliest[Math.floor(random() * earliest.length)];
+  if (eligible.length === 0) return null;
+  const earliestDue = Math.min(...eligible.map((p) => p.state.due));
+  const bucket = eligible.filter((p) => p.state.due <= earliestDue + DUE_WINDOW);
+  return { card: bucket[Math.floor(random() * bucket.length)], earliestDue };
 }
 
 export function nextInterval(state: CardState, result: Result, hints: number): number {
@@ -497,12 +502,13 @@ async function main(): Promise<void> {
 
     let continueAnyway = false;
     for (;;) {
-      const picked = selectCard(words, cards, directions);
-      if (picked === null) {
+      const selection = selectCard(words, cards, directions);
+      if (selection === null) {
         console.log(dim("nothing left to show this session"));
         return;
       }
-      const wait = picked.state.due - nowSeconds();
+      const picked = selection.card;
+      const wait = selection.earliestDue - nowSeconds();
       if (wait > 0 && !continueAnyway) {
         console.log(`\n${bold("nothing due right now")}  ${dim(`next card in ${humanize(wait)}`)}`);
         console.log(dim("  Enter to continue anyway, Ctrl-D to quit"));
