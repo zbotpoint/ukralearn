@@ -66,8 +66,8 @@ interface Picked {
 }
 
 interface Selection {
-  card: Picked;
-  earliestDue: number;
+  due: Picked | null;
+  soonest: Picked;
 }
 
 const DIRECTIONS: Record<Direction, { cue: Lang; answer: Lang; label: string }> = {
@@ -201,9 +201,9 @@ function splitKey(key: string): { wordId: string; direction: Direction } {
 }
 
 /**
- * Every eligible card due by now + DUE_WINDOW counts as due now; one is picked
- * uniformly at random so exact due times do not fix the order. When nothing is
- * due, the window is taken from the earliest due card instead.
+ * Every eligible card due by now + DUE_WINDOW counts as due now, and `due` is one
+ * of them picked uniformly at random, or null if there are none. `soonest` is the
+ * card with the earliest due time, ties broken at random.
  */
 export function selectCard(
   words: Map<string, Word>,
@@ -221,10 +221,13 @@ export function selectCard(
     eligible.push({ key, word, direction, state });
   }
   if (eligible.length === 0) return null;
+  const pick = (from: Picked[]): Picked => from[Math.floor(random() * from.length)];
   const earliestDue = Math.min(...eligible.map((p) => p.state.due));
-  const cutoff = Math.max(now, earliestDue) + DUE_WINDOW;
-  const bucket = eligible.filter((p) => p.state.due <= cutoff);
-  return { card: bucket[Math.floor(random() * bucket.length)], earliestDue };
+  const bucket = eligible.filter((p) => p.state.due <= now + DUE_WINDOW);
+  return {
+    due: bucket.length > 0 ? pick(bucket) : null,
+    soonest: pick(eligible.filter((p) => p.state.due === earliestDue)),
+  };
 }
 
 export function nextInterval(state: CardState, result: Result, hints: number): number {
@@ -383,8 +386,8 @@ const MENU: ReadonlyArray<[key: string, mode: string, label: string]> = [
 ];
 
 const CHART_BUCKETS: ReadonlyArray<[label: string, withinSeconds: number]> = [
-  ["due now", 0],
-  ["≤ 10 min", 600],
+  ["due now", DUE_WINDOW],
+  ["≤ 15 min", 900],
   ["≤ 1 h", 3600],
   ["≤ 6 h", 6 * 3600],
   ["≤ 1 d", DAY],
@@ -511,16 +514,19 @@ async function main(): Promise<void> {
         console.log(dim("nothing left to show this session"));
         return;
       }
-      const picked = selection.card;
-      const wait = selection.earliestDue - now;
-      if (wait > DUE_WINDOW && !continueAnyway) {
-        console.log(`\n${bold("nothing due right now")}  ${dim(`next card in ${humanize(wait)}`)}`);
-        console.log(dim("  Enter to continue anyway, Ctrl-D to quit"));
-        if ((await prompt.ask()) === null) {
-          console.log();
-          return;
+      let picked = selection.due;
+      if (picked === null) {
+        if (!continueAnyway) {
+          const wait = selection.soonest.state.due - now;
+          console.log(`\n${bold("nothing due right now")}  ${dim(`next card in ${humanize(wait)}`)}`);
+          console.log(dim("  Enter to continue anyway, Ctrl-D to quit"));
+          if ((await prompt.ask()) === null) {
+            console.log();
+            return;
+          }
+          continueAnyway = true;
         }
-        continueAnyway = true;
+        picked = selection.soonest;
       }
       const outcome = await challenge(prompt, picked.word, picked.direction);
       if (outcome === null) {
